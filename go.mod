@@ -1,4 +1,4 @@
-module github.com/vexis-security/vexis-sdk-go
+module github.com/disruptivetrends/vexis-sdk-go
 
 go 1.21
 
