@@ -1,132 +1,83 @@
-# VEXIS SDKs — AI Governance for Every Stack
+# palveron sdk-go
 
-Official SDKs for the VEXIS AI Governance Platform. Every LLM call. Every modality. Every trace — verified, audited, anchored.
+Official Go SDK for the **Palveron AI Governance Gateway** — policy enforcement, trace verification, and blockchain-anchored audit trails for every AI interaction.
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/palveron/sdk-go.svg)](https://pkg.go.dev/github.com/palveron/sdk-go)
+[![Go Report Card](https://goreportcard.com/badge/github.com/palveron/sdk-go?style=flat-square)](https://goreportcard.com/report/github.com/palveron/sdk-go)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+[![Documentation](https://img.shields.io/badge/docs-palveron.com-5A67D8?style=flat-square)](https://docs.palveron.com/sdks)
+
+---
+
+Every AI interaction your Go service makes — governed, audited, and optionally anchored to the blockchain. Stdlib-only client.
+
+- **Zero dependencies** — pure stdlib, ships in your binary at ~50 kB
+- **Multi-modal** — text, images, audio, documents, code
+- **Enterprise-grade** — retry with exponential backoff, circuit breaker, typed errors
+- **On-prem ready** — point to any Palveron gateway endpoint
+
+## Installation
+
+```bash
+go get github.com/palveron/sdk-go@v1.0.0
+```
 
 ## Quick Start
 
-### TypeScript / JavaScript
-```bash
-npm install @vexis/sdk
-```
-```typescript
-import { Vexis } from '@vexis/sdk';
-
-const vexis = new Vexis({ apiKey: process.env.VEXIS_API_KEY! });
-
-// Text verification
-const result = await vexis.verify({ prompt: 'User input here' });
-if (result.decision === 'BLOCKED') throw new Error(result.reason);
-
-// With image attachment
-const result = await vexis.verifyWithFile('Analyze this', './photo.jpg');
-
-// Quick check
-const { decision } = await vexis.check('Is this safe?');
-```
-
-### Python
-```bash
-pip install vexis-sdk
-```
-```python
-from vexis import Vexis, Attachment
-
-client = Vexis(api_key="gp_live_xxx")
-
-# Text verification
-result = client.verify("User input here")
-if result.is_blocked:
-    raise RuntimeError(result.reason)
-
-# With file attachment
-result = client.verify_file("Analyze this", "/path/to/doc.pdf")
-
-# Async
-from vexis import AsyncVexis
-async with AsyncVexis(api_key="gp_live_xxx") as client:
-    result = await client.verify("Check this")
-```
-
-### Go
-```bash
-go get github.com/vexis-security/vexis-sdk-go
-```
 ```go
-client := vexis.NewClient("gp_live_xxx",
-    vexis.WithBaseURL("https://gateway.acme.corp:8080"),
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
+
+    palveron "github.com/palveron/sdk-go"
 )
 
-result, err := client.Verify(ctx, &vexis.VerifyRequest{
-    Prompt: "User input here",
-})
-if result.IsBlocked() {
-    log.Fatal(result.Reason)
+func main() {
+    client := palveron.NewClient(os.Getenv("PALVERON_API_KEY"))
+
+    result, err := client.Verify(context.Background(), &palveron.VerifyRequest{
+        Prompt: "Transfer $50,000 to account DE89370400440532013000",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if result.Decision == palveron.Blocked {
+        log.Fatalf("Blocked by policy: %s", result.Reason)
+    }
+
+    // Always use result.Output instead of the raw prompt so downstream
+    // LLMs never see PII / secrets the gateway redacted.
+    fmt.Println(result.Output, result.TraceID)
 }
 ```
 
-### Java / Kotlin
-```java
-var client = Vexis.builder("gp_live_xxx")
-    .baseUrl("https://gateway.acme.corp:8080")
-    .timeout(Duration.ofSeconds(10))
-    .build();
+## Features
 
-var result = client.verify("User input here");
-if (result.isBlocked()) {
-    throw new SecurityException(result.reason());
-}
-```
+- **Policy enforcement** — every prompt routed through your active guardrails before it reaches an LLM
+- **Trace verification** — every decision logged with an integrity hash for tamper detection
+- **Multi-modal attachments** — file helpers with auto MIME detection
+- **Agentic / MCP context** — pass `RequestContext` so the audit trail captures the tool chain
+- **Blockchain attestation** — high-severity traces anchored to Flare for cryptographic audit trails
 
-## Features (All SDKs)
+## Requirements
 
-| Feature | TS | Python | Go | Java |
-|---------|:--:|:------:|:--:|:----:|
-| Text verification | ✅ | ✅ | ✅ | ✅ |
-| Multi-modal (image/audio/doc/code) | ✅ | ✅ | ✅ | ✅ |
-| File attachment helpers | ✅ | ✅ | ✅ | ✅ |
-| MCP/Agentic context | ✅ | ✅ | ✅ | ✅ |
-| Retry with exponential backoff | ✅ | ✅ | ✅ | ✅ |
-| Circuit breaker | ✅ | ✅ | ✅ | ✅ |
-| Typed errors | ✅ | ✅ | ✅ | ✅ |
-| Request ID tracking | ✅ | ✅ | ✅ | ✅ |
-| Health check | ✅ | ✅ | ✅ | ✅ |
-| Async support | ✅ | ✅ | ✅ (goroutines) | ✅ (CompletableFuture) |
-| Zero/minimal dependencies | ✅ (0) | httpx | ✅ (0) | ✅ (0) |
-| On-prem / custom endpoint | ✅ | ✅ | ✅ | ✅ |
-| Custom headers (proxy/auth) | ✅ | ✅ | ✅ | ✅ |
-| Type-safe (strict mode) | ✅ | ✅ (py.typed) | ✅ | ✅ (records) |
+- Go **1.21 or newer**
+- No third-party runtime dependencies
 
-## On-Premise Configuration
+## Links
 
-All SDKs support custom endpoints for on-premise deployments:
-
-```typescript
-const vexis = new Vexis({
-  apiKey: 'gp_live_xxx',
-  baseUrl: 'https://gateway.internal.acme.corp:8080',
-  timeout: 10_000,
-  maxRetries: 5,
-});
-```
-
-## Error Handling
-
-All SDKs provide typed, structured errors:
-
-| Error | Code | Retryable | Meaning |
-|-------|------|:---------:|---------|
-| `VexisAuthenticationError` | `AUTHENTICATION_FAILED` | ❌ | Invalid or expired API key |
-| `VexisRateLimitError` | `RATE_LIMITED` | ✅ | Request quota exceeded |
-| `VexisValidationError` | `VALIDATION_ERROR` | ❌ | Malformed request |
-| `VexisTimeoutError` | `TIMEOUT` | ✅ | Gateway didn't respond in time |
-| `VexisCircuitOpenError` | `CIRCUIT_OPEN` | ❌ | Too many consecutive failures |
-
-## Versioning
-
-SDKs follow [SemVer](https://semver.org/). All SDKs are versioned together:
-- `0.x.y` — Beta (current). Breaking changes possible between minor versions.
-- `1.0.0` — Stable GA. Breaking changes only in major versions.
+- **Documentation** — [docs.palveron.com/sdks](https://docs.palveron.com/sdks)
+- **Dashboard** — [palveron.com](https://palveron.com)
+- **Support** — [hello@palveron.com](mailto:hello@palveron.com)
+- **GitHub** — [palveron/sdk-go](https://github.com/palveron/sdk-go)
+- **GoDoc** — [pkg.go.dev/github.com/palveron/sdk-go](https://pkg.go.dev/github.com/palveron/sdk-go)
+- **Changelog** — [CHANGELOG.md](https://github.com/palveron/sdk-go/blob/main/CHANGELOG.md)
 
 ## License
 
-Apache 2.0
+[MIT](./LICENSE) — Copyright © 2026 Palveron.

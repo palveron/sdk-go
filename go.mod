@@ -1,4 +1,4 @@
-module github.com/disruptivetrends/vexis-sdk-go
+module github.com/palveron/sdk-go
 
 go 1.21
 

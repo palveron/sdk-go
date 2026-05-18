@@ -1,18 +1,18 @@
-// Package vexis provides the official Go SDK for the VEXIS AI Governance Platform.
+// Package palveron provides the official Go SDK for the PALVERON AI Governance Platform.
 //
 // Usage:
 //
-//	client := vexis.NewClient("gp_live_xxx")
-//	result, err := client.Verify(ctx, &vexis.VerifyRequest{
+//	client := palveron.NewClient("pv_live_xxx")
+//	result, err := client.Verify(ctx, &palveron.VerifyRequest{
 //	    Prompt: "User input here",
 //	})
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	if result.Decision == vexis.Blocked {
+//	if result.Decision == palveron.Blocked {
 //	    log.Fatalf("Blocked: %s", result.Reason)
 //	}
-package vexis
+package palveron
 
 import (
 	"bytes"
@@ -33,7 +33,7 @@ import (
 
 const (
 	Version        = "0.5.0"
-	DefaultBaseURL = "https://gateway.vexis.io"
+	DefaultBaseURL = "https://gateway.palveron.com"
 	DefaultTimeout = 30 * time.Second
 )
 
@@ -61,7 +61,7 @@ type Attachment struct {
 func AttachmentFromFile(path string) (*Attachment, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("vexis: read file: %w", err)
+		return nil, fmt.Errorf("palveron: read file: %w", err)
 	}
 	ct := mime.TypeByExtension(filepath.Ext(path))
 	if ct == "" {
@@ -131,8 +131,8 @@ type HealthResponse struct {
 
 // ── Errors ──────────────────────────────────────────────────
 
-// VexisError is the base error type for all SDK errors.
-type VexisError struct {
+// PalveronError is the base error type for all SDK errors.
+type PalveronError struct {
 	Code       string
 	Message    string
 	StatusCode int
@@ -140,16 +140,16 @@ type VexisError struct {
 	Retryable  bool
 }
 
-func (e *VexisError) Error() string {
+func (e *PalveronError) Error() string {
 	if e.RequestID != "" {
-		return fmt.Sprintf("vexis: %s (code=%s, status=%d, request_id=%s)", e.Message, e.Code, e.StatusCode, e.RequestID)
+		return fmt.Sprintf("palveron: %s (code=%s, status=%d, request_id=%s)", e.Message, e.Code, e.StatusCode, e.RequestID)
 	}
-	return fmt.Sprintf("vexis: %s (code=%s, status=%d)", e.Message, e.Code, e.StatusCode)
+	return fmt.Sprintf("palveron: %s (code=%s, status=%d)", e.Message, e.Code, e.StatusCode)
 }
 
 // IsAuthError returns true if the error is an authentication failure.
 func IsAuthError(err error) bool {
-	if e, ok := err.(*VexisError); ok {
+	if e, ok := err.(*PalveronError); ok {
 		return e.StatusCode == 401
 	}
 	return false
@@ -157,7 +157,7 @@ func IsAuthError(err error) bool {
 
 // IsRateLimited returns true if the error is a rate limit.
 func IsRateLimited(err error) bool {
-	if e, ok := err.(*VexisError); ok {
+	if e, ok := err.(*PalveronError); ok {
 		return e.StatusCode == 429
 	}
 	return false
@@ -234,7 +234,7 @@ func WithHeaders(h map[string]string) Option { return func(c *Client) { c.header
 
 // ── Client ──────────────────────────────────────────────────
 
-// Client is the VEXIS API client.
+// Client is the PALVERON API client.
 type Client struct {
 	apiKey     string
 	baseURL    string
@@ -245,7 +245,7 @@ type Client struct {
 	circuit    *circuitBreaker
 }
 
-// NewClient creates a new VEXIS client.
+// NewClient creates a new PALVERON client.
 func NewClient(apiKey string, opts ...Option) *Client {
 	c := &Client{
 		apiKey:     apiKey,
@@ -299,7 +299,7 @@ func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
 
 func (c *Client) do(ctx context.Context, method, path string, body, out interface{}) error {
 	if !c.circuit.canRequest() {
-		return &VexisError{Code: "CIRCUIT_OPEN", Message: "circuit breaker open", StatusCode: 503}
+		return &PalveronError{Code: "CIRCUIT_OPEN", Message: "circuit breaker open", StatusCode: 503}
 	}
 
 	var lastErr error
@@ -320,7 +320,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out interfac
 			return nil
 		}
 
-		if ve, ok := err.(*VexisError); ok && !ve.Retryable {
+		if ve, ok := err.(*PalveronError); ok && !ve.Retryable {
 			return ve
 		}
 
@@ -335,20 +335,20 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body, out inte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("vexis: marshal: %w", err)
+			return fmt.Errorf("palveron: marshal: %w", err)
 		}
 		bodyReader = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return fmt.Errorf("vexis: create request: %w", err)
+		return fmt.Errorf("palveron: create request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "vexis-sdk-go/"+Version)
+	req.Header.Set("User-Agent", "sdk-go/"+Version)
 	req.Header.Set("X-Request-ID", reqID)
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
@@ -356,7 +356,7 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body, out inte
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return &VexisError{Code: "NETWORK_ERROR", Message: err.Error(), Retryable: true, RequestID: reqID}
+		return &PalveronError{Code: "NETWORK_ERROR", Message: err.Error(), Retryable: true, RequestID: reqID}
 	}
 	defer resp.Body.Close()
 
@@ -371,20 +371,20 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body, out inte
 
 	switch resp.StatusCode {
 	case 401:
-		return &VexisError{Code: "AUTH_FAILED", Message: "invalid API key", StatusCode: 401, RequestID: rid}
+		return &PalveronError{Code: "AUTH_FAILED", Message: "invalid API key", StatusCode: 401, RequestID: rid}
 	case 429:
-		return &VexisError{Code: "RATE_LIMITED", Message: "rate limit exceeded", StatusCode: 429, RequestID: rid, Retryable: true}
+		return &PalveronError{Code: "RATE_LIMITED", Message: "rate limit exceeded", StatusCode: 429, RequestID: rid, Retryable: true}
 	case 400:
 		var errBody struct{ Error string `json:"error"` }
 		json.NewDecoder(resp.Body).Decode(&errBody)
-		return &VexisError{Code: "VALIDATION", Message: errBody.Error, StatusCode: 400, RequestID: rid}
+		return &PalveronError{Code: "VALIDATION", Message: errBody.Error, StatusCode: 400, RequestID: rid}
 	}
 
 	if resp.StatusCode >= 500 {
-		return &VexisError{Code: "SERVER_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid, Retryable: true}
+		return &PalveronError{Code: "SERVER_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid, Retryable: true}
 	}
 
-	return &VexisError{Code: "CLIENT_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid}
+	return &PalveronError{Code: "CLIENT_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid}
 }
 
 func backoff(attempt int) time.Duration {
@@ -398,5 +398,5 @@ func backoff(attempt int) time.Duration {
 }
 
 func makeRequestID() string {
-	return fmt.Sprintf("vx_%x_%x", time.Now().UnixMilli(), rand.Int31())
+	return fmt.Sprintf("pv_%x_%x", time.Now().UnixMilli(), rand.Int31())
 }
