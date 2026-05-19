@@ -32,19 +32,36 @@ import (
 )
 
 const (
-	Version        = "0.5.0"
+	Version        = "1.1.0"
 	DefaultBaseURL = "https://gateway.palveron.com"
 	DefaultTimeout = 30 * time.Second
 )
 
-// Decision represents a governance decision.
+// Decision represents a governance decision returned by /api/v1/verify.
+//
+// Sprint 87 — the gateway maps each Decision onto a matching HTTP status:
+//
+//	PASSED / ALLOWED / MODIFIED / FLAGGED / POLICY_CHANGE → 200 OK
+//	PENDING_APPROVAL                                      → 202 Accepted
+//	BLOCKED                                               → 403 Forbidden
+//	RATE_LIMITED                                          → 429 Too Many Requests
+//	ERROR                                                 → transport/internal failure
+//
+// RATE_LIMITED is synthesised client-side when the gateway returns 429
+// with the tier-rate-limit body shape (no decision field) so callers
+// can branch on Decision uniformly instead of also checking for errors.
 type Decision string
 
 const (
-	Allowed  Decision = "ALLOWED"
-	Blocked  Decision = "BLOCKED"
-	Modified Decision = "MODIFIED"
-	Error    Decision = "ERROR"
+	Passed          Decision = "PASSED"
+	Allowed         Decision = "ALLOWED"
+	Blocked         Decision = "BLOCKED"
+	Modified        Decision = "MODIFIED"
+	Flagged         Decision = "FLAGGED"
+	PendingApproval Decision = "PENDING_APPROVAL"
+	PolicyChange    Decision = "POLICY_CHANGE"
+	RateLimited     Decision = "RATE_LIMITED"
+	Error           Decision = "ERROR"
 )
 
 // ── Request / Response Types ────────────────────────────────
@@ -114,13 +131,28 @@ type VerifyResponse struct {
 	ContentType   string    `json:"content_type"`
 	Findings      []Finding `json:"findings"`
 	LatencyMs     float64   `json:"-"` // Client-measured
+
+	// RetryAfterMs is populated when Decision == RateLimited. Honour
+	// it before issuing the next request. Derived from the gateway's
+	// Retry-After header (in milliseconds).
+	RetryAfterMs int64 `json:"-"`
+
+	// HTTPStatus is the HTTP status code that produced this response
+	// (200, 202, 403, 429). Useful for observability.
+	HTTPStatus int `json:"-"`
 }
 
-// IsAllowed returns true if the decision is ALLOWED.
-func (r *VerifyResponse) IsAllowed() bool { return r.Decision == Allowed }
+// IsAllowed returns true if the decision is ALLOWED or PASSED.
+func (r *VerifyResponse) IsAllowed() bool { return r.Decision == Allowed || r.Decision == Passed }
 
 // IsBlocked returns true if the decision is BLOCKED.
 func (r *VerifyResponse) IsBlocked() bool { return r.Decision == Blocked }
+
+// IsPendingApproval returns true if the request is queued for human approval.
+func (r *VerifyResponse) IsPendingApproval() bool { return r.Decision == PendingApproval }
+
+// IsRateLimited returns true if the request was rejected by the tier rate-limit.
+func (r *VerifyResponse) IsRateLimited() bool { return r.Decision == RateLimited }
 
 // HealthResponse represents the gateway health status.
 type HealthResponse struct {
@@ -264,14 +296,45 @@ func NewClient(apiKey string, opts ...Option) *Client {
 }
 
 // Verify sends a governance verification request.
+//
+// Sprint 87 — the gateway maps the Decision field onto an HTTP status
+// (200 PASSED / 202 PENDING_APPROVAL / 403 BLOCKED / 429 RATE_LIMITED).
+// Verify treats all four as legitimate governance outcomes and returns
+// a *VerifyResponse for each; it does not error on 403 or 429. Only
+// transport, auth, validation, and 5xx failures return an error.
 func (c *Client) Verify(ctx context.Context, req *VerifyRequest) (*VerifyResponse, error) {
 	start := time.Now()
 	var resp VerifyResponse
-	if err := c.do(ctx, "POST", "/api/v1/verify", req, &resp); err != nil {
+	status, retryAfterMs, err := c.doGoverned(ctx, "POST", "/api/v1/verify", req, &resp)
+	if err != nil {
 		return nil, err
 	}
 	resp.LatencyMs = float64(time.Since(start).Milliseconds())
+	resp.HTTPStatus = status
+	resp.RetryAfterMs = retryAfterMs
+	// Synthesise decision from HTTP status when the body has none
+	// (notably 429 rate-limit responses carry a different body shape).
+	if resp.Decision == "" {
+		resp.Decision = decisionFromStatus(status)
+	}
 	return &resp, nil
+}
+
+// decisionFromStatus synthesises a Decision from an HTTP status code
+// when the response body had no Decision field.
+func decisionFromStatus(status int) Decision {
+	switch {
+	case status == 429:
+		return RateLimited
+	case status == 403:
+		return Blocked
+	case status == 202:
+		return PendingApproval
+	case status >= 200 && status < 300:
+		return Passed
+	default:
+		return Error
+	}
 }
 
 // Check is a convenience method for text-only verification.
@@ -298,8 +361,21 @@ func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out interface{}) error {
+	_, _, err := c.doInner(ctx, method, path, body, out, false)
+	return err
+}
+
+// doGoverned issues a request that accepts governance-status responses
+// (202 / 403 / 429) as success — used by Verify. Returns the HTTP
+// status code that produced the body and, for 429, the Retry-After
+// header parsed into milliseconds.
+func (c *Client) doGoverned(ctx context.Context, method, path string, body, out interface{}) (int, int64, error) {
+	return c.doInner(ctx, method, path, body, out, true)
+}
+
+func (c *Client) doInner(ctx context.Context, method, path string, body, out interface{}, expectGovernance bool) (int, int64, error) {
 	if !c.circuit.canRequest() {
-		return &PalveronError{Code: "CIRCUIT_OPEN", Message: "circuit breaker open", StatusCode: 503}
+		return 0, 0, &PalveronError{Code: "CIRCUIT_OPEN", Message: "circuit breaker open", StatusCode: 503}
 	}
 
 	var lastErr error
@@ -308,41 +384,41 @@ func (c *Client) do(ctx context.Context, method, path string, body, out interfac
 			delay := backoff(attempt)
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return 0, 0, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
 
 		reqID := makeRequestID()
-		err := c.doOnce(ctx, method, path, body, out, reqID)
+		status, retryAfterMs, err := c.doOnce(ctx, method, path, body, out, reqID, expectGovernance)
 		if err == nil {
 			c.circuit.onSuccess()
-			return nil
+			return status, retryAfterMs, nil
 		}
 
 		if ve, ok := err.(*PalveronError); ok && !ve.Retryable {
-			return ve
+			return 0, 0, ve
 		}
 
 		c.circuit.onFailure()
 		lastErr = err
 	}
-	return lastErr
+	return 0, 0, lastErr
 }
 
-func (c *Client) doOnce(ctx context.Context, method, path string, body, out interface{}, reqID string) error {
+func (c *Client) doOnce(ctx context.Context, method, path string, body, out interface{}, reqID string, expectGovernance bool) (int, int64, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("palveron: marshal: %w", err)
+			return 0, 0, fmt.Errorf("palveron: marshal: %w", err)
 		}
 		bodyReader = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return fmt.Errorf("palveron: create request: %w", err)
+		return 0, 0, fmt.Errorf("palveron: create request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
@@ -356,12 +432,18 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body, out inte
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return &PalveronError{Code: "NETWORK_ERROR", Message: err.Error(), Retryable: true, RequestID: reqID}
+		return 0, 0, &PalveronError{Code: "NETWORK_ERROR", Message: err.Error(), Retryable: true, RequestID: reqID}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return json.NewDecoder(resp.Body).Decode(out)
+		// Sprint 87 — for governance calls, 202 (PENDING_APPROVAL)
+		// arrives here alongside 200. Decode and let the caller branch
+		// on the Decision field.
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			return resp.StatusCode, 0, err
+		}
+		return resp.StatusCode, 0, nil
 	}
 
 	rid := resp.Header.Get("X-Request-ID")
@@ -369,22 +451,66 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body, out inte
 		rid = reqID
 	}
 
+	// ── Sprint 87 governance status codes ──
+	// Verify-path 403 (BLOCKED) and 429 (RATE_LIMITED) carry actionable
+	// bodies and are *not* errors. The caller asked for governance
+	// semantics by setting expectGovernance; surface the body instead.
+	if expectGovernance && (resp.StatusCode == 403 || resp.StatusCode == 429) {
+		// Decode body — 403 has a verify-shaped body, 429 has the
+		// rate-limit error shape. The caller post-processes either way.
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			// Body wasn't valid JSON, fall through to standard error
+			// handling so the caller sees a transport error rather than
+			// a confusingly-empty VerifyResponse.
+			return 0, 0, &PalveronError{Code: "DECODE_ERROR", Message: err.Error(), StatusCode: resp.StatusCode, RequestID: rid}
+		}
+		retryAfterMs := int64(0)
+		if resp.StatusCode == 429 {
+			retryAfterMs = parseRetryAfter(resp.Header.Get("Retry-After"))
+		}
+		return resp.StatusCode, retryAfterMs, nil
+	}
+
 	switch resp.StatusCode {
 	case 401:
-		return &PalveronError{Code: "AUTH_FAILED", Message: "invalid API key", StatusCode: 401, RequestID: rid}
+		return 0, 0, &PalveronError{Code: "AUTH_FAILED", Message: "invalid API key", StatusCode: 401, RequestID: rid}
 	case 429:
-		return &PalveronError{Code: "RATE_LIMITED", Message: "rate limit exceeded", StatusCode: 429, RequestID: rid, Retryable: true}
+		retryAfterMs := parseRetryAfter(resp.Header.Get("Retry-After"))
+		return 0, retryAfterMs, &PalveronError{Code: "RATE_LIMITED", Message: "rate limit exceeded", StatusCode: 429, RequestID: rid, Retryable: true}
 	case 400:
 		var errBody struct{ Error string `json:"error"` }
 		json.NewDecoder(resp.Body).Decode(&errBody)
-		return &PalveronError{Code: "VALIDATION", Message: errBody.Error, StatusCode: 400, RequestID: rid}
+		return 0, 0, &PalveronError{Code: "VALIDATION", Message: errBody.Error, StatusCode: 400, RequestID: rid}
 	}
 
 	if resp.StatusCode >= 500 {
-		return &PalveronError{Code: "SERVER_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid, Retryable: true}
+		return 0, 0, &PalveronError{Code: "SERVER_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid, Retryable: true}
 	}
 
-	return &PalveronError{Code: "CLIENT_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid}
+	return 0, 0, &PalveronError{Code: "CLIENT_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid}
+}
+
+// parseRetryAfter parses an HTTP Retry-After header into milliseconds.
+// Supports both delta-seconds (RFC 7231 §7.1.3) and HTTP-date forms.
+// Returns 0 when the header is missing or unparseable.
+func parseRetryAfter(value string) int64 {
+	if value == "" {
+		return 0
+	}
+	// Try delta-seconds
+	var seconds float64
+	if _, err := fmt.Sscanf(value, "%f", &seconds); err == nil && seconds >= 0 {
+		return int64(seconds * 1000)
+	}
+	// Try HTTP-date
+	if t, err := http.ParseTime(value); err == nil {
+		delta := time.Until(t).Milliseconds()
+		if delta < 0 {
+			return 0
+		}
+		return delta
+	}
+	return 0
 }
 
 func backoff(attempt int) time.Duration {
