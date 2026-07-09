@@ -478,9 +478,11 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body, out inte
 		retryAfterMs := parseRetryAfter(resp.Header.Get("Retry-After"))
 		return 0, retryAfterMs, &PalveronError{Code: "RATE_LIMITED", Message: "rate limit exceeded", StatusCode: 429, RequestID: rid, Retryable: true}
 	case 400:
-		var errBody struct{ Error string `json:"error"` }
-		json.NewDecoder(resp.Body).Decode(&errBody)
-		return 0, 0, &PalveronError{Code: "VALIDATION", Message: errBody.Error, StatusCode: 400, RequestID: rid}
+		msg := errorMessageFromBody(resp.Body)
+		if msg == "" {
+			msg = "Bad request"
+		}
+		return 0, 0, &PalveronError{Code: "VALIDATION", Message: msg, StatusCode: 400, RequestID: rid}
 	}
 
 	if resp.StatusCode >= 500 {
@@ -488,6 +490,38 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body, out inte
 	}
 
 	return 0, 0, &PalveronError{Code: "CLIENT_ERROR", Message: fmt.Sprintf("HTTP %d", resp.StatusCode), StatusCode: resp.StatusCode, RequestID: rid}
+}
+
+// errorMessageFromBody extracts a human-readable message from a gateway
+// error body, tolerant of BOTH contract shapes:
+//   - legacy flat string: {"error":"message"}
+//   - structured object:  {"error":{"code","message","request_id"}}
+// Returns "" when the body carries no usable message (caller supplies a default).
+func errorMessageFromBody(r io.Reader) string {
+	data, err := io.ReadAll(r)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	var probe struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+	}
+	if json.Unmarshal(data, &probe) != nil {
+		return ""
+	}
+	if len(probe.Error) > 0 {
+		var obj struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(probe.Error, &obj) == nil && obj.Message != "" {
+			return obj.Message
+		}
+		var str string
+		if json.Unmarshal(probe.Error, &str) == nil && str != "" {
+			return str
+		}
+	}
+	return probe.Message
 }
 
 // parseRetryAfter parses an HTTP Retry-After header into milliseconds.
